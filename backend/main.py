@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pathlib import Path
+from contextlib import contextmanager
 
 import sqlite3
 import json
@@ -233,93 +234,46 @@ def load_ai_models():
 
 
 def get_connection():
-
     connection = sqlite3.connect(DB_PATH, timeout=10.0)
-
     connection.row_factory = sqlite3.Row
-
     connection.execute("PRAGMA journal_mode=WAL;")
-
     return connection
 
 
-
-
-
-def initialize_database():
-
+@contextmanager
+def get_db_cursor(commit: bool = False):
     connection = get_connection()
-
     try:
-
         cursor = connection.cursor()
-
-        cursor.execute(
-
-            """
-
-            CREATE TABLE IF NOT EXISTS network_tests (
-
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-
-
-                timestamp TEXT NOT NULL,
-
-
-
-                download_mbps REAL,
-
-
-
-                upload_mbps REAL,
-
-
-
-                ping_ms REAL,
-
-
-
-                jitter_ms REAL,
-
-
-
-                packet_loss REAL,
-
-
-
-                network_type TEXT,
-
-
-
-                connectivity_score REAL,
-
-
-
-                latitude REAL,
-
-
-
-                longitude REAL
-
-            )
-
-            """
-
-        )
-
-        connection.commit()
-
+        yield cursor
+        if commit:
+            connection.commit()
     finally:
-
         connection.close()
 
 
-
+def initialize_database():
+    with get_db_cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS network_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                download_mbps REAL,
+                upload_mbps REAL,
+                ping_ms REAL,
+                jitter_ms REAL,
+                packet_loss REAL,
+                network_type TEXT,
+                connectivity_score REAL,
+                latitude REAL,
+                longitude REAL
+            )
+            """
+        )
 
 
 initialize_database()
-from backend.final_predictor import final_predictor, FINAL_PREDICTOR_READY
 AI_MODELS_READY, AI_MODELS_MESSAGE = load_ai_models()
 
 
@@ -472,64 +426,48 @@ def ping():
 
 
 @app.get("/api/network-quality")
-
 def network_quality():
-
-    targets = ["1.1.1.1", "8.8.8.8"]
-
+    target = "1.1.1.1"
     packet_count = 10
-
     timeout_ms = 2000
 
-    is_windows = platform.system().lower() == "windows"
+    if platform.system().lower() == "windows":
+        command = [
+            "ping",
+            target,
+            "-n",
+            str(packet_count),
+            "-w",
+            str(timeout_ms),
+        ]
+    else:
+        timeout_sec = max(1, timeout_ms // 1000)
+        command = [
+            "ping",
+            "-c",
+            str(packet_count),
+            "-W",
+            str(timeout_sec),
+            target,
+        ]
 
-    last_error = None
-    output = ""
-    target_used = targets[0]
-
-    for target in targets:
-        target_used = target
-        if is_windows:
-            command = [
-                "ping",
-                target,
-                "-n",
-                str(packet_count),
-                "-w",
-                str(timeout_ms)
-            ]
-        else:
-            timeout_sec = max(1, timeout_ms // 1000)
-            command = [
-                "ping",
-                "-c",
-                str(packet_count),
-                "-W",
-                str(timeout_sec),
-                target
-            ]
-
-        try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            output = process.stdout
-            if output and ("time" in output.lower() or "ms" in output.lower()):
-                break
-        except subprocess.TimeoutExpired:
-            last_error = "Ping measurement timed out."
-            continue
-        except Exception as error:
-            last_error = str(error)
-            continue
-
-    if not output and last_error:
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = process.stdout
+    except subprocess.TimeoutExpired:
         raise HTTPException(
-            status_code=504 if "timed out" in str(last_error).lower() else 500,
-            detail=f"Ping measurement failed: {last_error}"
+            status_code=504,
+            detail="Ping measurement timed out.",
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ping measurement failed: {error}",
         )
 
 
@@ -662,7 +600,7 @@ def network_quality():
 
         return {
 
-            "target": target_used,
+            "target": target,
 
             "packets_sent": packet_count,
 
@@ -923,90 +861,54 @@ def network_quality():
 
 
 @app.post("/api/network-test")
-
 def save_network_test(data: NetworkTest):
+    timestamp = data.timestamp or datetime.now(timezone.utc).isoformat()
 
-
-
-    timestamp = (
-
-        data.timestamp
-
-        or datetime.now(timezone.utc).isoformat()
-
-    )
-
-
-
-
-
-    connection = None
     try:
-        connection = get_connection()
-        cursor = connection.cursor()
-
-        cursor.execute(
-            """
-            INSERT INTO network_tests (
-                timestamp,
-                download_mbps,
-                upload_mbps,
-                ping_ms,
-                jitter_ms,
-                packet_loss,
-                network_type,
-                connectivity_score,
-                latitude,
-                longitude
+        with get_db_cursor(commit=True) as cursor:
+            cursor.execute(
+                """
+                INSERT INTO network_tests (
+                    timestamp,
+                    download_mbps,
+                    upload_mbps,
+                    ping_ms,
+                    jitter_ms,
+                    packet_loss,
+                    network_type,
+                    connectivity_score,
+                    latitude,
+                    longitude
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    data.download_mbps,
+                    data.upload_mbps,
+                    data.ping_ms,
+                    data.jitter_ms,
+                    data.packet_loss,
+                    data.network_type,
+                    data.connectivity_score,
+                    data.latitude,
+                    data.longitude,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                timestamp,
-                data.download_mbps,
-                data.upload_mbps,
-                data.ping_ms,
-                data.jitter_ms,
-                data.packet_loss,
-                data.network_type,
-                data.connectivity_score,
-                data.latitude,
-                data.longitude
-            )
-        )
-
-        connection.commit()
-        test_id = cursor.lastrowid
+            test_id = cursor.lastrowid
     except sqlite3.Error as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error while saving network test: {error}"
+            detail=f"Database error while saving network test: {error}",
         )
-    finally:
-        if connection:
-            connection.close()
 
     if not final_predictor.ready:
         final_predictor.train()
 
-
-
-
-
     return {
-
-
-
         "status": "success",
-
-
-
         "message": "Network test saved",
-
-
-
-        "id": test_id
-
+        "id": test_id,
     }
 
 
@@ -1022,29 +924,37 @@ def save_network_test(data: NetworkTest):
 
 
 @app.get("/api/network-history")
-
-def get_network_history(
-
-    range: str = "recent"
-
-):
-
-
-
-    connection = None
+def get_network_history(range: str = "recent"):
     try:
-        connection = get_connection()
-        cursor = connection.cursor()
-
-
-
-
-
-        if range.isdigit():
-            limit = int(range)
-            cursor.execute(
-                """
-                SELECT * FROM (
+        with get_db_cursor() as cursor:
+            if range.isdigit():
+                limit = int(range)
+                cursor.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT
+                            id,
+                            timestamp,
+                            download_mbps,
+                            upload_mbps,
+                            ping_ms,
+                            jitter_ms,
+                            packet_loss,
+                            network_type,
+                            connectivity_score,
+                            latitude,
+                            longitude
+                        FROM network_tests
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (limit,),
+                )
+            elif range == "all":
+                cursor.execute(
+                    """
                     SELECT
                         id,
                         timestamp,
@@ -1058,105 +968,71 @@ def get_network_history(
                         latitude,
                         longitude
                     FROM network_tests
-                    ORDER BY timestamp DESC, id DESC
-                    LIMIT ?
+                    ORDER BY timestamp ASC, id ASC
+                    """
                 )
-                ORDER BY timestamp ASC, id ASC
-                """,
-                (limit,)
-            )
+            elif range in ("hourly", "daily", "weekly", "monthly"):
+                now_utc = datetime.now(timezone.utc)
+                if range == "hourly":
+                    since = now_utc - timedelta(hours=24)
+                elif range == "daily":
+                    since = now_utc - timedelta(days=7)
+                elif range == "weekly":
+                    since = now_utc - timedelta(days=30)
+                else:
+                    since = now_utc - timedelta(days=365)
 
-        elif range == "all":
-            cursor.execute(
-                """
-                SELECT
-                    id,
-                    timestamp,
-                    download_mbps,
-                    upload_mbps,
-                    ping_ms,
-                    jitter_ms,
-                    packet_loss,
-                    network_type,
-                    connectivity_score,
-                    latitude,
-                    longitude
-                FROM network_tests
-                ORDER BY timestamp ASC, id ASC
-                """
-            )
-
-        elif range in ("hourly", "daily", "weekly", "monthly"):
-            now_utc = datetime.now(timezone.utc)
-            if range == "hourly":
-                since = now_utc - timedelta(hours=24)
-            elif range == "daily":
-                since = now_utc - timedelta(days=7)
-            elif range == "weekly":
-                since = now_utc - timedelta(days=30)
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        timestamp,
+                        download_mbps,
+                        upload_mbps,
+                        ping_ms,
+                        jitter_ms,
+                        packet_loss,
+                        network_type,
+                        connectivity_score,
+                        latitude,
+                        longitude
+                    FROM network_tests
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (since.isoformat(),),
+                )
             else:
-                since = now_utc - timedelta(days=365)
-
-            cursor.execute(
-                """
-                SELECT
-                    id,
-                    timestamp,
-                    download_mbps,
-                    upload_mbps,
-                    ping_ms,
-                    jitter_ms,
-                    packet_loss,
-                    network_type,
-                    connectivity_score,
-                    latitude,
-                    longitude
-                FROM network_tests
-                WHERE timestamp >= ?
-                ORDER BY timestamp ASC, id ASC
-                """,
-                (since.isoformat(),)
-            )
-
-        else:
-            # Default fallback for "recent" or any unrecognized range: return latest 10 records chronologically
-            cursor.execute(
-                """
-                SELECT * FROM (
-                    SELECT
-                        id,
-                        timestamp,
-                        download_mbps,
-                        upload_mbps,
-                        ping_ms,
-                        jitter_ms,
-                        packet_loss,
-                        network_type,
-                        connectivity_score,
-                        latitude,
-                        longitude
-                    FROM network_tests
-                    ORDER BY timestamp DESC, id DESC
-                    LIMIT 10
+                cursor.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT
+                            id,
+                            timestamp,
+                            download_mbps,
+                            upload_mbps,
+                            ping_ms,
+                            jitter_ms,
+                            packet_loss,
+                            network_type,
+                            connectivity_score,
+                            latitude,
+                            longitude
+                        FROM network_tests
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT 10
+                    )
+                    ORDER BY timestamp ASC, id ASC
+                    """
                 )
-                ORDER BY timestamp ASC, id ASC
-                """
-            )
 
-        rows = cursor.fetchall()
-        return [
-            dict(row)
-            for row in rows
-        ]
-
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
     except sqlite3.Error as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error while fetching network history: {error}"
+            detail=f"Database error while fetching network history: {error}",
         )
-    finally:
-        if connection:
-            connection.close()
 
 
 
@@ -1169,6 +1045,9 @@ def get_network_history(
 
 @app.get("/api/ai/status")
 def ai_status():
+    if not final_predictor.ready:
+        final_predictor.train()
+
     data = load_network_data() if AI_IMPORT_ERROR is None else []
 
     return {
@@ -1327,38 +1206,21 @@ def ai_analyze():
 
 
 @app.delete("/api/network-history")
-
 def delete_network_history():
-
-    connection = None
     try:
-        connection = get_connection()
-        cursor = connection.cursor()
-
-        cursor.execute(
-            "DELETE FROM network_tests"
-        )
-
-        connection.commit()
+        with get_db_cursor(commit=True) as cursor:
+            cursor.execute("DELETE FROM network_tests")
     except sqlite3.Error as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Database error while deleting network history: {error}"
+            detail=f"Database error while deleting network history: {error}",
         )
-    finally:
-        if connection:
-            connection.close()
 
-
-
-
+    final_predictor.train()
 
     return {
-
         "status": "success",
-
-        "message": "Network history deleted"
-
+        "message": "Network history deleted",
     }
 
 
